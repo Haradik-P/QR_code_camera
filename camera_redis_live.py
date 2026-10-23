@@ -8,6 +8,20 @@ from datetime import datetime
 
 
 # ==================================================
+# SETTINGS
+# ==================================================
+
+HOST = "0.0.0.0"
+PORT = 5000
+
+# After accepting one Data Matrix,
+# ignore every other reading for 5 seconds.
+COOLDOWN_SECONDS = 2
+
+last_accepted_scan_time = 0
+
+
+# ==================================================
 # REDIS CONNECTION
 # ==================================================
 
@@ -19,8 +33,10 @@ r = redis.Redis(
 
 try:
     print("Redis connected:", r.ping())
+
 except redis.ConnectionError:
     print("ERROR: Redis is not running.")
+    print("Start Redis Docker container first.")
     raise SystemExit
 
 
@@ -29,15 +45,55 @@ except redis.ConnectionError:
 # ==================================================
 
 def virtual_buzzer():
+    """
+    Virtual buzzer for duplicate detection.
+    Runs for approximately 5 seconds.
+    """
+
     try:
-        for _ in range(10):
-            winsound.Beep(2500, 200)
-            winsound.Beep(1800, 200)
-            winsound.Beep(2500, 200)
-            time.sleep(0.1)
+        start_time = time.time()
+
+        while time.time() - start_time < 5:
+            winsound.Beep(2200, 250)
+            winsound.Beep(1400, 250)
 
     except Exception as e:
         print("Buzzer error:", e)
+
+
+# ==================================================
+# 5 SECOND CAMERA COOLDOWN
+# ==================================================
+
+def scan_allowed():
+    """
+    Allows one scan and then blocks all scans
+    for COOLDOWN_SECONDS.
+    """
+
+    global last_accepted_scan_time
+
+    current_time = time.monotonic()
+
+    elapsed = current_time - last_accepted_scan_time
+
+    # Still inside cooldown
+    if elapsed < COOLDOWN_SECONDS:
+
+        remaining = COOLDOWN_SECONDS - elapsed
+
+        print(
+            f"⏳ IGNORED: Camera cooldown "
+            f"({remaining:.1f} sec remaining)"
+        )
+
+        return False
+
+    # Accept this scan and start new cooldown
+    last_accepted_scan_time = current_time
+
+    return True
+
 
 # ==================================================
 # REDIS PRODUCT LOGIC
@@ -45,20 +101,31 @@ def virtual_buzzer():
 
 def process_product(part_no, date_time, serial_no):
 
-    # Duplicate identity:
-    # Part No + Serial No
+    # --------------------------------------------------
+    # Duplicate condition:
+    #
+    # SAME Part No + SAME Serial No
+    #
+    # Different Part + Same Serial = VALID
+    # Same Part + Different Serial = VALID
+    # Same Part + Same Serial = DUPLICATE
+    # --------------------------------------------------
+
     product_key = f"product:{part_no}:{serial_no}"
 
-    # Atomic first-registration check
+    # Atomic check
+    #
+    # 1 = new Part No + Serial No combination
+    # 0 = already exists
     is_new = r.hsetnx(
         product_key,
         "registered",
         1
     )
 
-    # --------------------------------------------------
-    # NEW / VALID PRODUCT
-    # --------------------------------------------------
+    # ==================================================
+    # VALID PRODUCT
+    # ==================================================
 
     if is_new:
 
@@ -73,6 +140,7 @@ def process_product(part_no, date_time, serial_no):
             }
         )
 
+        # Product count based on Part No
         r.hincrby(
             "part_counts",
             part_no,
@@ -87,14 +155,16 @@ def process_product(part_no, date_time, serial_no):
         print("\n" + "=" * 55)
         print("✅ VALID PRODUCT")
         print("=" * 55)
+
         print("Part No     :", part_no)
-        print("Serial No   :", serial_no)
         print("Date & Time :", date_time)
+        print("Serial No   :", serial_no)
+
         print("=" * 55)
 
-    # --------------------------------------------------
-    # DUPLICATE
-    # --------------------------------------------------
+    # ==================================================
+    # DUPLICATE PRODUCT
+    # ==================================================
 
     else:
 
@@ -118,20 +188,22 @@ def process_product(part_no, date_time, serial_no):
         print("\n" + "=" * 55)
         print("🚨🚨🚨 DUPLICATE DETECTED 🚨🚨🚨")
         print("=" * 55)
+
         print("Part No     :", part_no)
-        print("Serial No   :", serial_no)
         print("Date & Time :", date_time)
+        print("Serial No   :", serial_no)
+
         print("=" * 55)
 
-        # Virtual buzzer
+        # Start virtual buzzer in background
         threading.Thread(
             target=virtual_buzzer,
             daemon=True
         ).start()
 
-    # --------------------------------------------------
-    # STORE EVERY SCAN
-    # --------------------------------------------------
+    # ==================================================
+    # SAVE EVERY ACCEPTED SCAN
+    # ==================================================
 
     r.xadd(
         "scan_events",
@@ -145,30 +217,43 @@ def process_product(part_no, date_time, serial_no):
 
 
 # ==================================================
-# CAMERA RECORD PATTERN
+# DATA MATRIX FORMAT
 # ==================================================
 
-# Example camera output:
+# Actual camera output:
 #
-# Part No     : PN-1030
-# Serial No   : SN-5026
-# Date & Time : 2026-09-25 12:32:00
+# 690129  21-10-202613:14:53  229583
 #
-# It also works if TCP joins everything:
 #
-# Part No : PN-1030Serial No : SN-5026Date & Time : ...
+# Meaning:
+#
+# Part No     = 690129
+# Date        = 21-10-2026
+# Time        = 13:14:53
+# Serial No   = 229583
+#
+#
+# The camera currently gives no space between:
+#
+# 21-10-2026
+# and
+# 13:14:53
+#
+# But \s* means this parser will accept BOTH:
+#
+# 21-10-202613:14:53
+#
+# and
+#
+# 21-10-2026 13:14:53
+
 
 record_pattern = re.compile(
-    r"Part\s*No\s*:\s*"
-    r"(?P<part_no>.*?)"
-    r"\s*Serial\s*No\s*:\s*"
-    r"(?P<serial_no>.*?)"
-    r"\s*Date\s*&\s*Time\s*:\s*"
-    r"(?P<date_time>"
-    r"\d{4}-\d{2}-\d{2}\s+"
-    r"\d{2}:\d{2}:\d{2}"
-    r")",
-    re.IGNORECASE | re.DOTALL
+    r"(?P<part_no>\d+)\s+"
+    r"(?P<date>\d{2}-\d{2}-\d{4})"
+    r"\s*"
+    r"(?P<time>\d{2}:\d{2}:\d{2})\s+"
+    r"(?P<serial_no>\d+)"
 )
 
 
@@ -178,129 +263,160 @@ record_pattern = re.compile(
 
 def process_buffer(buffer):
 
-    # --------------------------------------------------
-    # Remove CR/LF dependency
-    # --------------------------------------------------
-
-    buffer = buffer.replace("\r", " ")
-    buffer = buffer.replace("\n", " ")
-
     while True:
-
-        buffer = buffer.lstrip()
 
         # --------------------------------------------------
         # REMOVE NoRead
         # --------------------------------------------------
 
-        if buffer.startswith("NoRead"):
+        while "NoRead" in buffer:
+
+            buffer = buffer.replace(
+                "NoRead",
+                "",
+                1
+            )
 
             print("IGNORED: NoRead")
 
-            buffer = buffer[len("NoRead"):]
-
-            continue
-
         # --------------------------------------------------
-        # SEARCH FOR COMPLETE PRODUCT RECORD
+        # FIND COMPLETE DATA MATRIX
         # --------------------------------------------------
 
         match = record_pattern.search(buffer)
 
+        # Not enough data received yet
         if not match:
 
-            # Nothing complete yet.
-            # Keep buffer and wait for more TCP data.
+            # Safety against unlimited buffer growth
+            if len(buffer) > 5000:
+                buffer = buffer[-2000:]
 
-            # Avoid unlimited buffer growth
-            if len(buffer) > 10000:
-                buffer = buffer[-5000:]
-
-            break
+            return buffer
 
         # --------------------------------------------------
-        # Handle anything before Part No
-        # --------------------------------------------------
-
-        prefix = buffer[:match.start()]
-
-        # Remove any NoRead messages that appeared
-        # before the record
-        if "NoRead" in prefix:
-
-            count = prefix.count("NoRead")
-
-            for _ in range(count):
-                print("IGNORED: NoRead")
-
-        # --------------------------------------------------
-        # EXTRACT VALUES
+        # EXTRACT DATA MATRIX VALUES
         # --------------------------------------------------
 
         part_no = match.group(
             "part_no"
         ).strip()
 
+        date = match.group(
+            "date"
+        ).strip()
+
+        scan_time = match.group(
+            "time"
+        ).strip()
+
         serial_no = match.group(
             "serial_no"
         ).strip()
 
-        date_time = match.group(
-            "date_time"
-        ).strip()
+        # Normalize:
+        #
+        # 21-10-202613:14:53
+        #
+        # becomes:
+        #
+        # 21-10-2026 13:14:53
+
+        date_time = f"{date} {scan_time}"
 
         # --------------------------------------------------
-        # VALIDATION
+        # VALIDATE DATE AND TIME
         # --------------------------------------------------
 
-        if not part_no:
-            print("ERROR: Empty Part No")
+        try:
 
-        elif not serial_no:
-            print("ERROR: Empty Serial No")
+            datetime.strptime(
+                date_time,
+                "%d-%m-%Y %H:%M:%S"
+            )
+
+        except ValueError:
+
+            print(
+                "ERROR: Invalid Date & Time:",
+                date_time
+            )
+
+            # Remove bad record
+            buffer = buffer[
+                match.end():
+            ]
+
+            continue
+
+        # --------------------------------------------------
+        # SHOW CAMERA READING
+        # --------------------------------------------------
+
+        print("\nDATA MATRIX DETECTED")
+
+        print(
+            "Part No     :",
+            part_no
+        )
+
+        print(
+            "Date & Time :",
+            date_time
+        )
+
+        print(
+            "Serial No   :",
+            serial_no
+        )
+
+        # --------------------------------------------------
+        # 5 SECOND COOLDOWN CHECK
+        # --------------------------------------------------
+
+        if scan_allowed():
+
+            print(
+                "✅ Scan accepted - "
+                "5 second cooldown started."
+            )
+
+            process_product(
+                part_no=part_no,
+                date_time=date_time,
+                serial_no=serial_no
+            )
 
         else:
 
-            try:
+            # IMPORTANT:
+            #
+            # This scan is completely ignored.
+            #
+            # It is NOT:
+            #
+            # - stored in Redis
+            # - counted as total scan
+            # - counted as duplicate
+            # - counted as valid
+            # - added to scan_events
 
-                datetime.strptime(
-                    date_time,
-                    "%Y-%m-%d %H:%M:%S"
-                )
-
-                print("\nQR RECORD RECEIVED")
-                print("Part No     :", part_no)
-                print("Serial No   :", serial_no)
-                print("Date & Time :", date_time)
-
-                process_product(
-                    part_no,
-                    date_time,
-                    serial_no
-                )
-
-            except ValueError:
-
-                print(
-                    "ERROR: Invalid Date & Time:",
-                    date_time
-                )
+            print(
+                "Scan not stored in Redis."
+            )
 
         # --------------------------------------------------
-        # REMOVE PROCESSED RECORD FROM BUFFER
+        # REMOVE THIS RECORD FROM BUFFER
         # --------------------------------------------------
 
-        buffer = buffer[match.end():]
-
-    return buffer
+        buffer = buffer[
+            match.end():
+        ]
 
 
 # ==================================================
 # TCP SERVER
 # ==================================================
-
-HOST = "0.0.0.0"
-PORT = 5000
 
 server = socket.socket(
     socket.AF_INET,
@@ -320,11 +436,30 @@ server.bind(
 server.listen(5)
 
 
-print("\n---------------------------------------------")
-print(" SMART CAMERA DUPLICATE DETECTION SYSTEM")
-print("---------------------------------------------")
-print(f"Listening on TCP port {PORT}")
-print("Waiting for camera connection...")
+# ==================================================
+# START MESSAGE
+# ==================================================
+
+print("\n" + "=" * 60)
+
+print(
+    "SMART CAMERA DATA MATRIX "
+    "DUPLICATE DETECTION SYSTEM"
+)
+
+print("=" * 60)
+
+print(
+    f"Listening on TCP port {PORT}"
+)
+
+print(
+    f"Scan cooldown: {COOLDOWN_SECONDS} seconds"
+)
+
+print(
+    "Waiting for camera connection..."
+)
 
 
 # ==================================================
@@ -335,20 +470,34 @@ while True:
 
     conn, addr = server.accept()
 
-    print("\nCamera connected:", addr)
+    print(
+        "\nCamera connected:",
+        addr
+    )
 
-    # One continuous TCP buffer
+    # TCP is a stream.
+    #
+    # One Data Matrix can arrive across
+    # multiple recv() calls.
+    #
+    # Therefore we maintain a buffer.
+
     buffer = ""
 
     try:
 
         while True:
 
-            data = conn.recv(4096)
+            data = conn.recv(
+                4096
+            )
 
             if not data:
 
-                print("Camera disconnected")
+                print(
+                    "Camera disconnected"
+                )
+
                 break
 
             decoded = data.decode(
@@ -356,17 +505,20 @@ while True:
                 errors="replace"
             )
 
-            # Add new TCP bytes to existing buffer
+            # Add received TCP data
+            # to the existing buffer.
             buffer += decoded
 
-            # Try extracting complete QR records
+            # Find complete records
             buffer = process_buffer(
                 buffer
             )
 
     except ConnectionResetError:
 
-        print("Camera connection reset.")
+        print(
+            "Camera connection reset."
+        )
 
     except Exception as e:
 

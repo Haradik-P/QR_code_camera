@@ -33,6 +33,24 @@ r = redis.Redis(
     decode_responses=True
 )
 
+st.sidebar.subheader("System Controls")
+
+confirm_reset = st.sidebar.checkbox(
+    "I confirm I want to delete all stored data"
+)
+
+if st.sidebar.button(
+    "🗑️ Reset Redis Data",
+    type="primary",
+    disabled=not confirm_reset
+):
+    r.flushdb()
+
+    st.sidebar.success(
+        "Redis data cleared successfully."
+    )
+
+    st.rerun()
 
 # --------------------------------------------------
 # TITLE
@@ -115,26 +133,12 @@ if part_counts:
         by="Product Count",
         ascending=False
     )
-
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-
-        st.dataframe(
-            df_products,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    with col2:
-
-        chart_data = df_products.set_index(
-            "Part No"
-        )
-
-        st.bar_chart(
-            chart_data
-        )
+    
+    st.dataframe(
+    df_products,
+    width="stretch",
+    hide_index=True
+    )
 
 else:
 
