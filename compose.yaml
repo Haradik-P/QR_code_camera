@@ -1,0 +1,53 @@
+
+services:
+
+  camera:
+    build: .
+    image: smart-camera:v1
+    container_name: smart-camera-listener
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      SCAN_LOG_DIR: /data
+      TZ: Asia/Kolkata
+    ports:
+      - "5000:5000"
+    volumes:
+      - scan_logs:/data
+    depends_on:
+      - redis
+
+  dashboard:
+    image: smart-camera:v1
+    container_name: smart-camera-dashboard
+    restart: unless-stopped
+    command:
+      - streamlit
+      - run
+      - dashboard.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      SCAN_LOG_DIR: /data
+      TZ: Asia/Kolkata
+    ports:
+      - "8501:8501"
+    volumes:
+      - scan_logs:/data
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: smart-camera-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+  scan_logs:

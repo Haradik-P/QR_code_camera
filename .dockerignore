@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+.env.*
+scan_log.csv
+Dockerfile
+compose.yaml
